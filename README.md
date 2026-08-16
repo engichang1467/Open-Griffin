@@ -34,9 +34,10 @@ remaining gap between this and the paper's figures.
 
 All three stages are implemented and it runs end to end on SD 1.5. Identity transfer works, SAM
 refines a rectangular box into a real silhouette, and subjects land mostly inside the regions they
-were given (91% and 83% of mask area inside their boxes on the example spec).
+were given (90% of the eagle's mask area and 83% of the dog's fall inside their boxes on the example
+spec).
 
-Subjects still render smaller than their boxes allow, so the composition sits at roughly 65%
+Subjects still render smaller than their boxes allow, so the composition sits at roughly 63%
 background. The hyperparameters are the paper's, untuned.
 
 ## Install
@@ -103,10 +104,14 @@ K̂_n = α · (M_S^n ⊗ K_S^n) ⊕ K_T^n
 V̂_n =     (M_S^n ⊗ V_S^n) ⊕ V_T^n
 ```
 
+`K_T^n` and `V_T^n` are the target's own rows for region n *plus the background rows*. Leaving the
+other subjects out is what stops identity leaking between them; the background stays in, so a subject
+can still see the scene it is being composed into.
+
 α follows `1.2 / (1 + 2exp(-10t))`, starting near 1.2 and decaying to 0.4. The IP-Adapter scale drops
-to 0.8 here and to 0.4 at step 30. Pixels outside every region get plain self-attention and are
-driven by the text prompt, which is what keeps the background from picking up subject appearance. See
-[attn.py](griffin/attn.py).
+to 0.8 here and to 0.4 at step 30. Background pixels get plain self-attention over the whole target
+and are driven by the text prompt, which is what keeps the background from picking up subject
+appearance. See [attn.py](griffin/attn.py).
 
 **Steps 15, 20, 25 and 30, dynamic layout update.** The predicted clean image is matched against each
 source using DIFT and DINOv2 features mixed at β = 0.5. Otsu threshold drops the low-scoring pixels,
@@ -169,13 +174,12 @@ The paper's SDXL and FLUX variants aren't here, only SD 1.5. The optional per-su
 fine-tune (AdamW, lr 1e-4, 400 to 1000 steps, DCO loss) isn't implemented either, since the method
 works without it and that was the point.
 
-Two places where I had to pick a reading of the paper:
-
-The equations write `⊕ K_T` for the full target, but the text says a region attends only to its own
-component. I implemented the text. `--no-restrict-target` gives you the other reading.
-
 DIFT uses one noise draw per feature extraction where the original DIFT paper ensembles about eight.
 If correspondences come out noisy, that's the first thing to change.
+
+`--no-restrict-target` lets every region attend over the whole target instead, other subjects
+included. That is not the paper's mechanism, it is an ablation knob for seeing how much of the
+identity separation comes from the restriction.
 
 `flatten_mask` assumes square latents and raises otherwise.
 
