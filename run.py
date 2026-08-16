@@ -19,7 +19,7 @@ from diffusers import DDIMScheduler, StableDiffusionPipeline
 from PIL import Image
 
 from griffin.invert import invert
-from griffin.layout import FeatureExtractor, Segmenter, box_mask, load_mask, save_mask
+from griffin.layout import FeatureExtractor, Segmenter, box_mask, disjoin, load_mask, save_mask
 from griffin.pipeline import compose, load_adapters
 
 
@@ -32,6 +32,26 @@ def build_layout(subject: dict, height: int, width: int) -> torch.Tensor:
     if ("box" in subject) == ("mask" in subject):
         raise ValueError(f"subject {subject.get('subject')!r} needs exactly one of 'box' or 'mask'")
     return box_mask(subject["box"], height, width) if "box" in subject else load_mask(subject["mask"], height, width)
+
+
+def depth_sorted(subjects: list[dict]) -> list[dict]:
+    """Front-to-back, `order` 0 being frontmost.
+
+    A spec that never mentions depth comes back untouched, in spec order.
+    Sorting here, before anything else is built, is what lets everything
+    downstream treat list order as depth order without carrying a permutation
+    around.
+
+    Declaring `order` on some subjects but not others is rejected rather than
+    guessed at: an explicit `"order": 0` and the default position of the first
+    subject are the same number, and silently letting one win is how a subject
+    ends up behind the thing it was meant to occlude.
+    """
+    declared = [s for s in subjects if "order" in s]
+    if declared and len(declared) != len(subjects):
+        missing = ", ".join(repr(s.get("subject")) for s in subjects if "order" not in s)
+        raise ValueError(f"either every subject sets 'order' or none do; missing on {missing}")
+    return sorted(subjects, key=lambda s: s.get("order", 0)) if declared else list(subjects)
 
 
 def main():
@@ -52,8 +72,14 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    if args.seed is not None:
+        # the generator below only covers the initial latents; the dynamic layout
+        # update draws its DIFT noise from the global RNG, so --seed does not
+        # actually reproduce a run without this
+        torch.manual_seed(args.seed)
+
     spec = json.loads(args.spec.read_text())
-    subjects = spec["subjects"]
+    subjects = depth_sorted(spec["subjects"])
     root = args.spec.parent
     dtype = torch.float16 if args.device == "cuda" else torch.float32
 
@@ -80,7 +106,10 @@ def main():
             torch.save(cache, cached)
             caches.append(cache)
 
-    layouts = [build_layout(s, args.size, args.size) for s in subjects]
+    layouts = disjoin([build_layout(s, args.size, args.size) for s in subjects])
+    for subject, layout in zip(subjects, layouts):
+        if not layout.any():
+            raise ValueError(f"subject {subject['subject']!r} is fully occluded by the layouts in front of it")
 
     if args.debug_masks:
         args.debug_masks.mkdir(parents=True, exist_ok=True)
