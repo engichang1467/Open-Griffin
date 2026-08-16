@@ -1,0 +1,11 @@
+# torch and torchvision are installed separately, see `make install-pytorch`.
+
+diffusers==0.35.2
+transformers==4.57.1
+accelerate==1.11.0
+
+# threshold_otsu, for the correspondence filter and the source subject mask
+scikit-image==0.25.2
+
+# SAM and DINOv2 both come from transformers, so neither
+# segment-anything nor the dinov2 repo is needed.

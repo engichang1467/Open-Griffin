@@ -1,0 +1,18 @@
+{
+  "prompt": "a dog and a bald eagle with a white head in a sunlit forest clearing, highly detailed",
+  "negative_prompt": "blurry, low quality, distorted",
+  "subjects": [
+    {
+      "image": "../data/references/dog.png",
+      "prompt": "a photo of a dog",
+      "subject": "dog",
+      "box": [0.05, 0.35, 0.45, 0.95]
+    },
+    {
+      "image": "../data/references/eagle.png",
+      "prompt": "a photo of an eagle",
+      "subject": "eagle",
+      "box": [0.55, 0.05, 0.95, 0.6]
+    }
+  ]
+}
