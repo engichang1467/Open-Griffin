@@ -3,7 +3,14 @@
 import torch
 import torch.nn.functional as F
 
-from griffin.attn import SourceCache, alpha_schedule, flatten_mask, shared_attention
+from griffin.attn import (
+    GriffinAttnProcessor,
+    GriffinState,
+    SourceCache,
+    alpha_schedule,
+    flatten_mask,
+    shared_attention,
+)
 from griffin.invert import find_token, subject_mask
 from griffin.layout import box_mask, correspond, farthest_points, mix_features, save_mask, select_keypoints
 from griffin.pipeline import _ip_masks, ip_scale
@@ -27,25 +34,26 @@ def test_shared_attention():
     layout = torch.zeros(side, side, dtype=torch.bool)
     layout[:4] = True
     idx = flatten_mask(layout, seq)
+    bg = torch.arange(seq // 2, seq)  # everything the layout leaves out
     k_src, v_src = torch.randn(1, heads, 9, d), torch.randn(1, heads, 9, d)
     alpha = 0.7
 
-    out = shared_attention(q, k, v, [(idx, k_src, v_src)], alpha)
+    out = shared_attention(q, k, v, [(idx, k_src, v_src)], bg, alpha)
     plain = F.scaled_dot_product_attention(q, k, v)
 
-    # background rows keep plain target self-attention
-    bg = torch.arange(seq // 2, seq)
+    # background rows keep plain target self-attention (eq. 8)
     assert torch.allclose(out[:, :, bg], plain[:, :, bg], atol=1e-5)
 
-    # region rows attend over [alpha * source] ++ [their own target rows]
-    k_hat = torch.cat([alpha * k_src.expand(b, -1, -1, -1), k[:, :, idx]], dim=2)
-    v_hat = torch.cat([v_src.expand(b, -1, -1, -1), v[:, :, idx]], dim=2)
+    # region rows attend over [alpha * source] ++ [own target rows ++ background]
+    ctx = torch.cat([idx, bg])
+    k_hat = torch.cat([alpha * k_src.expand(b, -1, -1, -1), k[:, :, ctx]], dim=2)
+    v_hat = torch.cat([v_src.expand(b, -1, -1, -1), v[:, :, ctx]], dim=2)
     want = F.scaled_dot_product_attention(q[:, :, idx], k_hat, v_hat)
     assert torch.allclose(out[:, :, idx], want, atol=1e-5)
     assert not torch.allclose(out[:, :, idx], plain[:, :, idx], atol=1e-3)
 
     # alpha only scales the source logits, so alpha=0 still mixes in V_S
-    zero = shared_attention(q, k, v, [(idx, k_src, v_src)], 0.0)
+    zero = shared_attention(q, k, v, [(idx, k_src, v_src)], bg, 0.0)
     assert not torch.allclose(zero[:, :, idx], plain[:, :, idx], atol=1e-3)
 
 
@@ -59,12 +67,99 @@ def test_shared_attention_isolates_regions():
     top, bottom = torch.zeros(side, side, dtype=torch.bool), torch.zeros(side, side, dtype=torch.bool)
     top[:4], bottom[4:] = True, True
     i0, i1 = flatten_mask(top, seq), flatten_mask(bottom, seq)
+    none = torch.empty(0, dtype=torch.long)  # the two layouts tile the image
     src = [torch.randn(1, heads, 6, d) for _ in range(4)]
 
-    a = shared_attention(q, k, v, [(i0, src[0], src[1]), (i1, src[2], src[3])], 0.9)
-    b_ = shared_attention(q, k, v, [(i0, src[0], src[1]), (i1, torch.randn(1, heads, 6, d), src[3])], 0.9)
+    a = shared_attention(q, k, v, [(i0, src[0], src[1]), (i1, src[2], src[3])], none, 0.9)
+    b_ = shared_attention(q, k, v, [(i0, src[0], src[1]), (i1, torch.randn(1, heads, 6, d), src[3])], none, 0.9)
     assert torch.allclose(a[:, :, i0], b_[:, :, i0], atol=1e-6)
     assert not torch.allclose(a[:, :, i1], b_[:, :, i1], atol=1e-3)
+
+
+def test_region_attends_to_background_not_other_regions():
+    """Eq. 6/7: K^n_T covers layout component n and the background, nothing else.
+
+    So background content has to reach a region's rows, while a neighbouring
+    region's content must not. Both halves matter -- widening the gather to the
+    whole target would satisfy the first and break the second.
+    """
+    torch.manual_seed(2)
+    b, heads, side, d = 1, 2, 8, 16
+    seq = side * side
+    q, k, v = (torch.randn(b, heads, seq, d) for _ in range(3))
+
+    top, middle = torch.zeros(side, side, dtype=torch.bool), torch.zeros(side, side, dtype=torch.bool)
+    top[:2], middle[2:4] = True, True  # rows 4-7 are left over as background
+    i0, i1 = flatten_mask(top, seq), flatten_mask(middle, seq)
+    bg = torch.arange(seq // 2, seq)
+    src = [torch.randn(1, heads, 6, d) for _ in range(4)]
+    regions = [(i0, src[0], src[1]), (i1, src[2], src[3])]
+
+    base = shared_attention(q, k, v, regions, bg, 0.9)
+
+    moved_bg = k.clone()
+    moved_bg[:, :, bg] = torch.randn(b, heads, bg.numel(), d)
+    assert not torch.allclose(base[:, :, i0], shared_attention(q, moved_bg, v, regions, bg, 0.9)[:, :, i0], atol=1e-3)
+
+    moved_neighbour = k.clone()
+    moved_neighbour[:, :, i1] = torch.randn(b, heads, i1.numel(), d)
+    assert torch.allclose(base[:, :, i0], shared_attention(q, moved_neighbour, v, regions, bg, 0.9)[:, :, i0], atol=1e-6)
+
+
+def test_shared_attention_writes_only_its_region():
+    """The widened gather must not widen the write: rows outside `idx` stay plain."""
+    torch.manual_seed(3)
+    b, heads, side, d = 1, 2, 8, 16
+    seq = side * side
+    q, k, v = (torch.randn(b, heads, seq, d) for _ in range(3))
+
+    layout = torch.zeros(side, side, dtype=torch.bool)
+    layout[:2] = True
+    idx = flatten_mask(layout, seq)
+    bg = torch.arange(idx.numel(), seq)
+
+    out = shared_attention(q, k, v, [(idx, torch.randn(1, heads, 6, d), torch.randn(1, heads, 6, d))], bg, 0.9)
+    plain = F.scaled_dot_product_attention(q, k, v)
+    assert torch.allclose(out[:, :, bg], plain[:, :, bg], atol=1e-5)
+    assert not torch.allclose(out[:, :, idx], plain[:, :, idx], atol=1e-3)
+
+
+def test_shared_attention_empty_background():
+    """An empty `bg` is a plain concat with an empty index, not a special case."""
+    torch.manual_seed(4)
+    b, heads, side, d = 1, 2, 8, 16
+    seq = side * side
+    q, k, v = (torch.randn(b, heads, seq, d) for _ in range(3))
+
+    layout = torch.ones(side, side, dtype=torch.bool)
+    idx = flatten_mask(layout, seq)
+    k_src, v_src = torch.randn(1, heads, 6, d), torch.randn(1, heads, 6, d)
+
+    out = shared_attention(q, k, v, [(idx, k_src, v_src)], torch.empty(0, dtype=torch.long), 0.9)
+    k_hat = torch.cat([0.9 * k_src.expand(b, -1, -1, -1), k], dim=2)
+    v_hat = torch.cat([v_src.expand(b, -1, -1, -1), v], dim=2)
+    assert torch.allclose(out, F.scaled_dot_product_attention(q, k_hat, v_hat), atol=1e-5)
+
+
+def test_regions_background_is_the_complement():
+    """`_regions` hands back exactly the pixels no layout claimed, and no others."""
+    heads, side, d = 2, 4, 8
+    seq = side * side
+    layouts = [torch.zeros(8, 8, dtype=torch.bool) for _ in range(2)]
+    layouts[0][:2], layouts[1][2:4] = True, True  # bottom half unclaimed
+
+    caches = []
+    for _ in layouts:
+        cache = SourceCache()
+        cache.put("attn1", 0, torch.randn(1, heads, seq, d), torch.randn(1, heads, seq, d))
+        caches.append(cache)
+
+    state = GriffinState(mode="share", t=0, sources=caches, layouts=layouts)
+    regions, bg = GriffinAttnProcessor(state, "attn1")._regions(seq, torch.device("cpu"), torch.float32)
+
+    claimed = torch.cat([idx for idx, _, _ in regions])
+    assert sorted(claimed.tolist() + bg.tolist()) == list(range(seq)), "every pixel is claimed or background"
+    assert set(claimed.tolist()).isdisjoint(bg.tolist()), "a key must not sit in a region and the background"
 
 
 def test_alpha_schedule():

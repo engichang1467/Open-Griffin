@@ -66,22 +66,32 @@ def flatten_mask(mask: torch.Tensor, seq_len: int) -> torch.Tensor:
     return small.flatten().nonzero(as_tuple=True)[0]
 
 
-def shared_attention(query, key, value, regions, alpha: float, restrict_target: bool = True):
+def shared_attention(query, key, value, regions, bg, alpha: float, restrict_target: bool = True):
     """Attend, overwriting each layout region with its source-augmented attention.
 
     query/key/value: (B, heads, L, D) for the target.
     regions: list of (target_idx, k_src, v_src); k_src/v_src are (1, heads, Ls, D)
              already restricted to the source subject mask.
-    Pixels outside every region keep plain target self-attention -- that is the
-    background, driven by text rather than by any source.
+    bg: flat indices of the pixels in no region at all.
+
+    Per Griffin eq. (6) and (7), K^n_T and V^n_T are the target keys and values
+    "restricted to the pixels of layout component n and the background pixels",
+    so a region gathers over `idx ++ bg` while still only writing back to `idx`.
+    Excluding the *other* regions is what stops identity leaking between
+    subjects; the background was never meant to be cut off with them.
+
+    Pixels in `bg` keep plain target self-attention -- that is eq. (8), the
+    background driven by text rather than by any source.
     """
     out = F.scaled_dot_product_attention(query, key, value)
     batch = query.shape[0]
     for idx, k_src, v_src in regions:
         if idx.numel() == 0 or k_src.shape[2] == 0:
             continue
-        k_tgt = key[:, :, idx] if restrict_target else key
-        v_tgt = value[:, :, idx] if restrict_target else value
+        ctx = torch.cat([idx, bg])
+        k_tgt = key[:, :, ctx] if restrict_target else key
+        v_tgt = value[:, :, ctx] if restrict_target else value
+        # alpha scales the source keys only, never the target or background ones
         k_hat = torch.cat([alpha * k_src.expand(batch, -1, -1, -1), k_tgt], dim=2)
         v_hat = torch.cat([v_src.expand(batch, -1, -1, -1), v_tgt], dim=2)
         out[:, :, idx] = F.scaled_dot_product_attention(query[:, :, idx], k_hat, v_hat)
@@ -127,8 +137,8 @@ class GriffinAttnProcessor:
             state.capture.put(self.name, state.t, key, value)
             hidden_states = F.scaled_dot_product_attention(query, key, value)
         elif state.mode == "share" and state.sources:
-            regions = self._regions(key.shape[2], query.device, query.dtype)
-            hidden_states = shared_attention(query, key, value, regions, state.alpha, state.restrict_target)
+            regions, bg = self._regions(key.shape[2], query.device, query.dtype)
+            hidden_states = shared_attention(query, key, value, regions, bg, state.alpha, state.restrict_target)
         else:
             hidden_states = F.scaled_dot_product_attention(query, key, value)
 
@@ -142,16 +152,28 @@ class GriffinAttnProcessor:
         return hidden_states / attn.rescale_output_factor
 
     def _regions(self, seq_len, device, dtype):
+        """The per-source (idx, k_src, v_src) triples, plus the background index.
+
+        Occupancy is accumulated at attention resolution, after downsampling,
+        rather than by running `~(union of layouts)` back through
+        `flatten_mask`. Both give the same answer while the downsampling is
+        nearest -- sampling one pixel per cell commutes with union and
+        complement -- but only this one stays exactly disjoint from `idx` if
+        that ever becomes an averaging resize. Overlapping keys would otherwise
+        appear twice in one softmax.
+        """
         state = self.state
         regions = []
+        occupied = torch.zeros(seq_len, dtype=torch.bool, device=device)
         for src, layout in zip(state.sources, state.layouts):
             idx = flatten_mask(layout.to(device), seq_len).to(device)
+            occupied[idx] = True
             k_src, v_src = src.get(self.name, state.t, device, dtype)
             if src.mask is not None:
                 src_idx = flatten_mask(src.mask.to(device), k_src.shape[2]).to(device)
                 k_src, v_src = k_src[:, :, src_idx], v_src[:, :, src_idx]
             regions.append((idx, k_src, v_src))
-        return regions
+        return regions, (~occupied).nonzero(as_tuple=True)[0]
 
 
 class SubjectMapProcessor:
