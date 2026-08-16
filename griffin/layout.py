@@ -255,11 +255,10 @@ def update_layouts(
     # SAM re-derives every mask independently, so refined masks can overlap even
     # though the input layouts did not. Restore the partition eqs. 5-7 assume.
     updated = disjoin(updated)
-    # A subject SAM placed entirely inside the one in front would otherwise be
-    # left with nothing: diffusers tolerates an all-zero ip_adapter_mask (it is
-    # a plain multiplier) and shared_attention skips an empty region, so it
-    # would silently vanish rather than fail. The coarse layout it came in with
-    # is a better estimate than nothing.
+    # A subject SAM fully occluded by the one in front would otherwise be left with nothing and silently vanish, since diffusers tolerates an all-zero ip_adapter_mask as a plain multiplier and shared_attention skips empty regions, so fall back to the coarse incoming layout as a better estimate than nothing.
     # ponytail: that fallback can leave the pair overlapping until the next
     # refinement step. Iterate to a fixpoint only if it turns out to bite.
-    return [previous if not mask.any() else mask for mask, previous in zip(updated, layouts)]
+    return [
+        refined if refined.any() else previous
+        for refined, previous in zip(updated, layouts)
+    ]
