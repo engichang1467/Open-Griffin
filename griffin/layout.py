@@ -31,6 +31,23 @@ def box_mask(box, height: int, width: int) -> torch.Tensor:
     return mask
 
 
+def disjoin(masks: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Front-to-back masks -> disjoint masks.
+
+    The paper's preprocessing for overlapping layouts: "assuming an order for
+    the boxes and, as a preprocessing step, subtracting the front boxes from the
+    back boxes". Every pixel then belongs to exactly one component, which is
+    what partitioning Q_T into {Q^1_T, ..., Q^N_T, Q^bkd_T} assumes.
+
+    `masks` must already be ordered front first; that is the caller's job.
+    """
+    out, covered = [], torch.zeros_like(masks[0])
+    for mask in masks:
+        out.append(mask & ~covered)
+        covered |= mask
+    return out
+
+
 def load_mask(path, height: int, width: int) -> torch.Tensor:
     """Read a mask image (anything non-black is inside) at the target size."""
     import numpy as np
@@ -234,4 +251,14 @@ def update_layouts(
         mask = segmenter(target_image, points)
         # a mask that swallowed the frame is a SAM failure, not a layout
         updated.append(previous if mask.float().mean() > 0.9 else mask.to(previous.device))
-    return updated
+
+    # SAM re-derives every mask independently, so refined masks can overlap even
+    # though the input layouts did not. Restore the partition eqs. 5-7 assume.
+    updated = disjoin(updated)
+    # A subject SAM fully occluded by the one in front would otherwise be left with nothing and silently vanish, since diffusers tolerates an all-zero ip_adapter_mask as a plain multiplier and shared_attention skips empty regions, so fall back to the coarse incoming layout as a better estimate than nothing.
+    # ponytail: that fallback can leave the pair overlapping until the next
+    # refinement step. Iterate to a fixpoint only if it turns out to bite.
+    return [
+        refined if refined.any() else previous
+        for refined, previous in zip(updated, layouts)
+    ]

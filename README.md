@@ -72,6 +72,19 @@ The `subject` field has to appear verbatim in that subject's `prompt`. Its cross
 inversion is what produces the source mask, so the word needs to be in the prompt to have a map at
 all.
 
+Boxes may overlap. Add `"order"` to say what sits in front of what, 0 being frontmost, and the
+overlap is subtracted off the one behind before generation starts, so every pixel belongs to exactly
+one subject. Either every subject sets `order` or none do. See
+[examples/overlap.json](examples/overlap.json).
+
+```json
+{"subject": "eagle", "box": [0.35, 0.10, 0.95, 0.70], "order": 0}
+```
+
+Without `order`, subjects stay in the order the spec lists them, front first. Either way the debug
+masks are numbered front-to-back, so `layout_step30_subject0.png` is the frontmost subject rather
+than the first one written in the file.
+
 Name the attributes you want kept in the target prompt. From step 30 the IP-Adapter sits at 0.4 and α
 has decayed, so text drives the finish and anything the prompt leaves unsaid gets filled in from the
 model's generic prior. On the example above, "an eagle" produced a dark-headed generic eagle even
@@ -161,9 +174,9 @@ The source masks were not clipping anything. The eagle mask covered the white he
 why the eventual fix was in the prompt.
 
 The masks were not colliding. Recovering both from the overlays by differencing against the preview
-gave 0 overlapping pixels, despite bounding boxes that overlap. `shared_attention` applies regions in
-sequence and a later region silently overwrites an earlier one where they intersect, so overlapping
-masks are a real hazard, just not one I have managed to trigger.
+gave 0 overlapping pixels. That was never going to find anything: the dog spans x 0.05 to 0.45 and
+the eagle x 0.55 to 0.95, so the boxes do not overlap in the first place, and this spec cannot
+produce colliding masks. `examples/overlap.json` is the one that actually exercises it.
 
 The box aspect was not fighting the subject. The eagle looks wide but is diagonal, so its source mask
 bounding box is 0.56 by 0.76, aspect 0.73, against a box of 0.40 by 0.55, aspect 0.727.

@@ -12,9 +12,18 @@ from griffin.attn import (
     shared_attention,
 )
 from griffin.invert import find_token, subject_mask
-from griffin.layout import box_mask, correspond, farthest_points, mix_features, save_mask, select_keypoints
+from griffin.layout import (
+    box_mask,
+    correspond,
+    disjoin,
+    farthest_points,
+    mix_features,
+    save_mask,
+    select_keypoints,
+    update_layouts,
+)
 from griffin.pipeline import _ip_masks, ip_scale
-from run import build_layout
+from run import build_layout, depth_sorted
 
 
 def test_flatten_mask():
@@ -286,6 +295,91 @@ def test_build_layout():
             pass
         else:
             raise AssertionError("need exactly one of box/mask")
+
+
+def test_disjoin():
+    """Front keeps everything, back loses exactly the intersection."""
+    front = box_mask([0.0, 0.0, 0.6, 1.0], 10, 10)
+    back = box_mask([0.4, 0.0, 1.0, 1.0], 10, 10)
+    overlap = (front & back).sum()
+    assert overlap > 0, "this test is pointless if the boxes do not actually overlap"
+
+    a, b = disjoin([front, back])
+    assert not (a & b).any(), "masks must be disjoint afterwards"
+    assert torch.equal(a, front), "the frontmost mask keeps its full area"
+    assert b.sum() == back.sum() - overlap
+    assert torch.equal(a | b, front | back), "subtraction must not lose pixels to neither subject"
+
+
+def test_disjoin_chain():
+    """The third mask yields to both predecessors, not just the one before it."""
+    masks = [box_mask(box, 12, 12) for box in ([0.0, 0.0, 0.5, 0.5], [0.25, 0.0, 0.75, 0.5], [0.0, 0.0, 1.0, 1.0])]
+    a, b, c = disjoin(masks)
+    assert not (a & b).any() and not (a & c).any() and not (b & c).any()
+    assert not (c & masks[0]).any(), "the back mask must yield to the frontmost, not only its neighbour"
+
+
+def test_disjoin_leaves_non_overlapping_masks_alone():
+    """The common case is a no-op, so specs without overlap generate exactly as before."""
+    masks = [box_mask([0.0, 0.0, 0.4, 1.0], 8, 8), box_mask([0.6, 0.0, 1.0, 1.0], 8, 8)]
+    for before, after in zip(masks, disjoin(masks)):
+        assert torch.equal(before, after)
+
+
+def test_disjoin_can_empty_a_fully_occluded_mask():
+    masks = [box_mask([0.0, 0.0, 1.0, 1.0], 8, 8), box_mask([0.2, 0.2, 0.4, 0.4], 8, 8)]
+    front, behind = disjoin(masks)
+    assert front.all()
+    assert not behind.any(), "a subject entirely behind another has nothing left"
+
+
+def test_depth_sorted():
+    subjects = [{"subject": "dog"}, {"subject": "eagle"}, {"subject": "cat"}]
+    assert [s["subject"] for s in depth_sorted(subjects)] == ["dog", "eagle", "cat"], "no order key is a no-op"
+
+    ordered = [{"subject": "dog", "order": 2}, {"subject": "eagle", "order": 0}, {"subject": "cat", "order": 1}]
+    assert [s["subject"] for s in depth_sorted(ordered)] == ["eagle", "cat", "dog"], "order 0 is frontmost"
+
+    # half-declared depth is ambiguous -- an explicit order 0 and a default
+    # position 0 are the same number -- so it is rejected instead of guessed
+    try:
+        depth_sorted([{"subject": "dog"}, {"subject": "eagle", "order": 0}])
+    except ValueError as error:
+        assert "dog" in str(error), "the error should name the subject that is missing an order"
+    else:
+        raise AssertionError("a partially ordered spec should be rejected")
+
+
+def test_update_layouts_returns_disjoint_masks():
+    """SAM re-derives each mask alone, so `update_layouts` has to re-partition them."""
+
+    class Preview:
+        size = (16, 16)
+
+    overlapping = [box_mask([0.0, 0.0, 0.7, 1.0], 16, 16), box_mask([0.3, 0.0, 1.0, 1.0], 16, 16)]
+    calls = iter(overlapping)
+
+    # a fresh feature map per call: identical ones would make every correspondence
+    # score 1.0, and Otsu cannot threshold a range of zero
+    generator = torch.Generator().manual_seed(0)
+
+    def extractor(latents, embeds, beta=0.5):
+        return F.normalize(torch.randn(1, 64, 8, generator=generator), dim=-1)
+
+    layouts = [box_mask([0.0, 0.0, 0.5, 1.0], 16, 16), box_mask([0.5, 0.0, 1.0, 1.0], 16, 16)]
+    out = update_layouts(
+        extractor,
+        lambda image, points: next(calls),
+        torch.randn(1, 4, 8, 8),
+        Preview(),
+        [torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8)],
+        [torch.ones(8, 8, dtype=torch.bool), torch.ones(8, 8, dtype=torch.bool)],
+        layouts,
+        torch.randn(1, 77, 8),
+    )
+    assert len(out) == 2
+    assert not (out[0] & out[1]).any(), "refined masks must not overlap"
+    assert torch.equal(out[0], overlapping[0]), "the frontmost refined mask is kept whole"
 
 
 def test_save_mask():
